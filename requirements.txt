@@ -1,0 +1,7 @@
+altair
+lightgbm
+numpy
+pandas
+scikit-learn
+streamlit
+xgboost
