@@ -11,31 +11,28 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 import warnings
 import os
 import altair as alt
+import joblib
+import pickle
 
 warnings.filterwarnings('ignore')
 
-
-# Feature Engineering Function (Updated for your data)
 def engineer_features(df):
-    df['Date'] = pd.to_datetime(df['Date'])  # Ensure Date is datetime
+    df['Date'] = pd.to_datetime(df['Date'])
     df['DayOfWeek'] = df['Date'].dt.dayofweek
     df['MonthOfYear'] = df['Date'].dt.month
     df['IsHomeGame'] = np.where(df['HomeTeam'] == df['Team'], 1, 0)
     df['GoalDifference'] = df['GF'] - df['GA']
 
-    # Basic xG/xGA estimation (since you don't have these columns)
     df['xG'] = df['GF'] * np.random.normal(1, 0.1, len(df))
     df['xGA'] = df['GA'] * np.random.normal(1, 0.1, len(df))
     df['xGDifference'] = df['xG'] - df['xGA']
 
-    # Calculate points
     df['Points'] = np.select(
         [df['GF'] > df['GA'], df['GF'] == df['GA'], df['GF'] < df['GA']],
         [3, 1, 0],
         default=0
     )
 
-    # Recent performance metrics (using expanding window)
     metrics = ['GF', 'GA', 'xG', 'xGA', 'Points']
     for metric in metrics:
         df[f'{metric}_ExpandingAvg'] = df.groupby('Team')[metric].transform(
@@ -44,64 +41,50 @@ def engineer_features(df):
 
     return df
 
-# Train Ensemble Model Function
 def train_ensemble_model(X, y):
     imputer = SimpleImputer(strategy='mean')
     X_imputed = imputer.fit_transform(X)
 
     X_train, X_test, y_train, y_test = train_test_split(X_imputed, y, test_size=0.2, random_state=42)
 
-    # Ensemble of diverse models
     models = [
         RandomForestRegressor(n_estimators=100, random_state=42),
         XGBRegressor(n_estimators=100, random_state=42),
         LGBMRegressor(n_estimators=100, random_state=42),
     ]
 
-    # Train each model and make predictions
-    predictions = []
+    trained_models = []
     for model in models:
         model.fit(X_train, y_train)
-        predictions.append(model.predict(X_test))
+        trained_models.append(model)
 
-    # Average predictions from all models
-    ensemble_predictions = np.mean(predictions, axis=0)
+    ensemble_predictions = np.mean([model.predict(X_test) for model in trained_models], axis=0)
 
-    # Evaluate the ensemble model performance
     print(f"MAE: {mean_absolute_error(y_test, ensemble_predictions)}")
     print(f"RMSE: {mean_squared_error(y_test, ensemble_predictions, squared=False)}")
 
-    return lambda X: np.mean([model.predict(X) for model in models], axis=0)  # Return prediction function
+    return trained_models, imputer
 
-# Prediction Function (Updated)
-def predict_team_performance(df, team_name, next_season):
-    team_data = df[df['Team'] == team_name].copy()
+def predict_team_performance(team_data, team_name, next_season, models_dict):
     last_season = team_data['Season'].max()
 
-    # Check if there is data for the selected team in the last season
     if len(team_data[team_data['Season'] == last_season]) == 0:
         print(f"No data found for {team_name} in the last season. Cannot make predictions.")
-        return None  # Return None to indicate that predictions cannot be made
+        return None
 
     features = ['DayOfWeek', 'MonthOfYear', 'IsHomeGame', 'xG', 'xGA',
                 'GF_ExpandingAvg', 'GA_ExpandingAvg', 'xG_ExpandingAvg',
                 'xGA_ExpandingAvg', 'Points_ExpandingAvg']
 
-    X = team_data[features]
-
-    # Train models for goals scored, goals against, and points
-    goals_scored_model = train_ensemble_model(X, team_data['GF'])
-    goals_against_model = train_ensemble_model(X, team_data['GA'])
-    points_model = train_ensemble_model(X, team_data['Points'])
-
-    # Predict for the next season (simplified - assumes similar schedule)
     next_season_data = team_data[team_data['Season'] == last_season].copy()
     next_season_data['Season'] = next_season
     next_season_data['MonthOfYear'] = 8  # Assuming season starts in August
 
-    predicted_goals_scored = goals_scored_model(next_season_data[features]).mean() * 38  # Adjust for 38 games
-    predicted_goals_against = goals_against_model(next_season_data[features]).mean() * 38  # Adjust for 38 games
-    predicted_points = points_model(next_season_data[features]).mean() * 38  # Adjust for 38 games
+    X = models_dict['imputer'].transform(next_season_data[features])
+
+    predicted_goals_scored = np.mean([model.predict(X) for model in models_dict['goals_scored']], axis=0).mean() * 38
+    predicted_goals_against = np.mean([model.predict(X) for model in models_dict['goals_against']], axis=0).mean() * 38
+    predicted_points = np.mean([model.predict(X) for model in models_dict['points']], axis=0).mean() * 38
 
     return {
         'Total Points': round(predicted_points),
@@ -109,25 +92,22 @@ def predict_team_performance(df, team_name, next_season):
         'Goals Against': round(predicted_goals_against),
     }
 
-# Function to predict rank based on predicted points (Updated with rank limit)
-def predict_rank(df, all_teams, next_season):
+def predict_rank(df, all_teams, next_season, models_dict):
     rankings = []
     for team in all_teams:
-        prediction_result = predict_team_performance(df, team, next_season)
+        team_data = df[df['Team'] == team]
+        prediction_result = predict_team_performance(team_data, team, next_season, models_dict)
         if prediction_result is not None:
             rankings.append((team, prediction_result['Total Points']))
         else:
-            # Handle teams not in predictions (e.g., newly promoted) - assign average points
             rankings.append((team, df['Points'].mean()))
 
     rankings.sort(key=lambda x: x[1], reverse=True)
-    team_ranks = {team: min(rank, 20) for rank, (team, points) in enumerate(rankings, 1)}  # Limit rank to 20
+    team_ranks = {team: min(rank, 20) for rank, (team, points) in enumerate(rankings, 1)}
     return team_ranks
 
-
-@st.cache_data
-def load_and_process_data():
-    df = pd.read_csv("deduplicated_full_match_data.csv")
+def preprocess_and_save_data(input_csv_path, output_pickle_path):
+    df = pd.read_csv(input_csv_path)
 
     home_df = df.copy()
     home_df['Team'] = home_df['HomeTeam']
@@ -143,11 +123,42 @@ def load_and_process_data():
     df['Season'] = df['Date'].str.split('-').str[0].astype(int)
     df = engineer_features(df)
 
+    with open(output_pickle_path, 'wb') as f:
+        pickle.dump(df, f)
+
+    print(f"Preprocessed data saved to {output_pickle_path}")
+
+@st.cache_resource
+def load_preprocessed_data(pickle_path):
+    with open(pickle_path, 'rb') as f:
+        df = pickle.load(f)
     return df
 
 @st.cache_data
 def load_historical_data():
     return pd.read_csv("premier_league_standings.csv")
+
+def train_and_save_models(df, models_pickle_path):
+    features = ['DayOfWeek', 'MonthOfYear', 'IsHomeGame', 'xG', 'xGA',
+                'GF_ExpandingAvg', 'GA_ExpandingAvg', 'xG_ExpandingAvg',
+                'xGA_ExpandingAvg', 'Points_ExpandingAvg']
+    X = df[features]
+
+    models_dict = {}
+    models_dict['goals_scored'], models_dict['imputer'] = train_ensemble_model(X, df['GF'])
+    models_dict['goals_against'], _ = train_ensemble_model(X, df['GA'])
+    models_dict['points'], _ = train_ensemble_model(X, df['Points'])
+
+    with open(models_pickle_path, 'wb') as f:
+        pickle.dump(models_dict, f)
+
+    print(f"Trained models saved to {models_pickle_path}")
+
+@st.cache_resource
+def load_trained_models(models_pickle_path):
+    with open(models_pickle_path, 'rb') as f:
+        models_dict = pickle.load(f)
+    return models_dict
 
 def create_ranking_chart(historical_data, team_name):
     team_data = historical_data[historical_data['team'] == team_name]
@@ -185,29 +196,28 @@ def main():
 
     st.title("Premier League Teams Performance Predictor")
 
-    # Load and process data
-    df = load_and_process_data()
+    data_pickle_path = "preprocessed_data.pkl"
+    models_pickle_path = "trained_models.pkl"
+
+    df = load_preprocessed_data(data_pickle_path)
+    models_dict = load_trained_models(models_pickle_path)
     historical_data = load_historical_data()
 
-    # Get list of teams and next season
     all_teams = sorted(df['Team'].unique())
     next_season = df['Season'].max() + 1
 
-    # Create dropdown for team selection
     selected_team = st.selectbox("Select a team:", all_teams)
 
     if st.button("Predict Performance"):
-        # Make prediction
-        prediction_result = predict_team_performance(df, selected_team, next_season)
+        team_data = df[df['Team'] == selected_team]
+        prediction_result = predict_team_performance(team_data, selected_team, next_season, models_dict)
         
         if prediction_result is not None:
-            team_ranks = predict_rank(df, all_teams, next_season)
+            team_ranks = predict_rank(df, all_teams, next_season, models_dict)
 
-            # Display results
             col1, col2 = st.columns([1, 2])
 
             with col1:
-                # Display team logo
                 logo_path = f"logos/{selected_team.lower().replace(' ', '_')}.svg"
                 if os.path.exists(logo_path):
                     st.image(logo_path, width=150)
@@ -222,7 +232,6 @@ def main():
                 st.write(f"Predicted Goals Conceded: {prediction_result['Goals Against']}")
                 st.write(f"Predicted Rank: {team_ranks[selected_team]}")
 
-            # Visualize the prediction
             st.subheader("Performance Visualization")
             
             chart_data = pd.DataFrame({
@@ -238,7 +247,6 @@ def main():
 
             st.altair_chart(chart, use_container_width=True)
 
-            # Historical performance charts
             st.subheader("Historical Performance")
             
             col1, col2 = st.columns(2)
@@ -253,6 +261,7 @@ def main():
 
         else:
             st.error(f"Unable to make predictions for {selected_team}.")
+
 
 if __name__ == "__main__":
     main()
