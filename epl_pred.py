@@ -226,7 +226,7 @@ def main():
 
             with col2:
                 st.subheader(f"Predictions for {selected_team}")
-                st.write(f"Season: {next_season}-{next_season+1}")
+                st.write("Season: 2024-2025")
                 st.write(f"Predicted Points: {prediction_result['Total Points']}")
                 st.write(f"Predicted Goals Scored: {prediction_result['Goals for']}")
                 st.write(f"Predicted Goals Conceded: {prediction_result['Goals Against']}")
